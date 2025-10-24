@@ -40,6 +40,10 @@ python pdf_to_markdown_processor.py
 ---
 
 ## 🐳 Docker Backend Setup
+### 0.1. Clone https://github.com/deepseek-ai/DeepSeek-OCR.git
+```bash
+git clone https://github.com/deepseek-ai/DeepSeek-OCR.git
+```
 
 ### 1. Download Model Weights
 
