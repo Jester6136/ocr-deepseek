@@ -80,13 +80,13 @@ docker-compose logs -f deepseek-ocr
 
 ```bash
 # Build the Docker image
-docker-compose build
+docker compose build
 
 # Start the service
-docker-compose up -d
+docker compose up -d
 
 # Check logs
-docker-compose logs -f deepseek-ocr
+docker compose logs -f deepseek-ocr
 ```
 
 ### 3. Verify Installation
