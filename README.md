@@ -63,19 +63,6 @@ git clone https://huggingface.co/deepseek-ai/DeepSeek-OCR models/deepseek-ai/Dee
 
 ### 2. Build and Run the Docker Container
 
-#### Windows Users
-
-```cmd
-REM Build the Docker image
-build.bat
-
-REM Start the service
-docker-compose up -d
-
-REM Check logs
-docker-compose logs -f deepseek-ocr
-```
-
 #### Linux/macOS Users
 
 ```bash

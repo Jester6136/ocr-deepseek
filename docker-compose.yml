@@ -3,15 +3,15 @@ services:
     build: .
     container_name: deepseek-ocr-vllm
     ports:
-      - "37001:8000"
+      - "1233:8000"
     volumes:
       - ./models:/app/models  # Mount directory for model weights
       - ./outputs:/app/outputs  # Mount directory for output files
     environment:
       - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
       - MODEL_PATH=${MODEL_PATH:-/app/models/deepseek-ai/DeepSeek-OCR}
-      - MAX_CONCURRENCY=${MAX_CONCURRENCY:-5}
-      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.7}
+      - MAX_CONCURRENCY=${MAX_CONCURRENCY:-1}
+      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.4}
     deploy:
       resources:
         reservations:
