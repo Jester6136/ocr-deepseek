@@ -13,11 +13,11 @@ from PIL import Image
 from fastapi import FastAPI, File, UploadFile, HTTPException
 import uvicorn
 from vllm import LLM, SamplingParams
-from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
+# from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor # Import cụ thể nếu cần
 
-app = FastAPI(title="DeepSeek OCR PDF API with Auto-Batching")
+app = FastAPI(title="DeepSeek OCR PDF API with Auto-Batching and Bottom-Left OCR (Improved Batching)")
 
-BATCH_SIZE_MODEL = 60
+BATCH_SIZE_MODEL = 104
 # ======= Load model once =======
 llm = LLM(
     model="/home/vms/bags/ocr-deepseek/models/deepseek-ai/DeepSeek-OCR",
@@ -26,7 +26,7 @@ llm = LLM(
     max_num_seqs=BATCH_SIZE_MODEL,
     max_model_len=1400,
     gpu_memory_utilization=0.8,
-    logits_processors=[NGramPerReqLogitsProcessor]
+    # logits_processors=[NGramPerReqLogitsProcessor] # Bỏ nếu không cần thiết hoặc import sai
 )
 
 # ======= OCR params =======
@@ -93,52 +93,98 @@ def _sync_resize_helper(images: List[Image.Image], size):
     """Helper function to run synchronous image resizing in a thread pool"""
     return [img.resize(size, Image.LANCZOS) for img in images]
 
-# ======= Batch processing helper =======
+# ======= Async Extract Bottom-Left Region =======
+async def extract_bottom_left_region_async(images: List[Image.Image]) -> List[Image.Image]:
+    """Extract the bottom-left region (3/10 width, 1/3 height) from a list of images asynchronously using ThreadPoolExecutor"""
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor() as executor:
+        cropped_images = await loop.run_in_executor(
+            executor,
+            _sync_extract_bottom_left_helper,
+            images
+        )
+    return cropped_images
+
+def _sync_extract_bottom_left_helper(images: List[Image.Image]):
+    """Helper function to run synchronous image cropping in a thread pool"""
+    cropped_list = []
+    for page_idx, img in enumerate(images):
+        width, height = img.size
+        # Calculate crop coordinates: left, top, right, bottom
+        # Left: 0 to 25% of width
+        # Bottom: from (height - 18% height) to full height
+        left   = 0
+        right  = int(width * 0.25)                 # 25% chiều rộng
+        bottom = height
+        top    = height - int(height * 0.18)       # 18% chiều cao từ đáy
+        cropped_img = img.crop((left, top, right, bottom))
+        cropped_list.append(cropped_img)
+    return cropped_list
+
+
+# ======= Batch processing helper (Cải tiến) =======
 def batch_process_images(
-    images_list: List[List[Image.Image]],
-    batch_size: int = BATCH_SIZE_MODEL  # Điều chỉnh kích thước batch theo khả năng GPU
-) -> List[List[str]]:
+    images_per_file_list: List[Tuple[List[Image.Image], List[Image.Image]]], # [(main_images_file1, extra_images_file1), ...]
+    batch_size: int = BATCH_SIZE_MODEL
+) -> Tuple[List[List[str]], List[List[str]]]: # Returns (main OCR results per file, extra OCR results per file)
     """
-    Xử lý batch các ảnh từ nhiều file.
-    images_list: [[img1_file1, img2_file1], [img1_file2], ...]
-    Trả về: [[text1_file1, text2_file1], [text1_file2], ...]
+    Xử lý batch các ảnh từ nhiều file. Gộp main và extra images vào một batch duy nhất để tối ưu hiệu suất.
+    images_per_file_list: [(main_imgs_file1, extra_imgs_file1), (main_imgs_file2, extra_imgs_file2), ...]
+    Trả về: ([main_texts_file1, main_texts_file2], [extra_texts_file1, extra_texts_file2])
     """
-    # Flatten tất cả ảnh và ghi nhớ index file gốc
-    flattened_images = []
-    file_indices = []
-    page_indices = []
+    all_images = []
+    all_prompts = []
+    # Lưu thông tin để phân tách kết quả sau này
+    file_info = [] # [(file_idx, 'main'/'extra', page_idx), ...]
 
-    for file_idx, images in enumerate(images_list):
-        for page_idx, img in enumerate(images):
-            flattened_images.append(img)
-            file_indices.append(file_idx)
-            page_indices.append(page_idx)
+    for file_idx, (main_images, extra_images) in enumerate(images_per_file_list):
+        # Thêm ảnh chính (main)
+        for page_idx, img in enumerate(main_images):
+            all_images.append(img)
+            all_prompts.append("<image>\nFree OCR.")
+            file_info.append((file_idx, 'main', page_idx))
 
-    if not flattened_images:
-        return [[] for _ in images_list]
+        # Thêm ảnh phụ (extra)
+        for page_idx, img in enumerate(extra_images):
+            all_images.append(img)
+            all_prompts.append("<image>\nFree OCR.")
+            file_info.append((file_idx, 'extra', page_idx))
 
-    # Tạo input cho vLLM
-    prompts = ["<image>\nFree OCR."] * len(flattened_images)
-    model_inputs = [
-        {"prompt": prompt, "multi_modal_data": {"image": img}}
-        for prompt, img in zip(prompts, flattened_images)
-    ]
-
-    # Chia thành các batch nhỏ hơn nếu cần
     all_outputs = []
-    for i in range(0, len(model_inputs), batch_size):
-        batch_inputs = model_inputs[i:i + batch_size]
-        batch_outputs = llm.generate(batch_inputs, sampling_param)
-        all_outputs.extend(batch_outputs)
+    if all_images:
+        model_inputs = [
+            {"prompt": prompt, "multi_modal_data": {"image": img}}
+            for prompt, img in zip(all_prompts, all_images)
+        ]
 
-    # Gom kết quả theo file gốc
-    results: List[List[str]] = [[] for _ in range(len(images_list))]
-    for i, output in enumerate(all_outputs):
-        file_idx = file_indices[i]
+        for i in range(0, len(model_inputs), batch_size):
+            batch_inputs = model_inputs[i:i + batch_size]
+            batch_outputs = llm.generate(batch_inputs, sampling_param)
+            all_outputs.extend(batch_outputs)
+
+    # Khởi tạo danh sách kết quả cho từng file
+    num_files = len(images_per_file_list)
+    main_results: List[List[str]] = [[] for _ in range(num_files)]
+    extra_results: List[List[str]] = [[] for _ in range(num_files)]
+
+    # Phân phối kết quả dựa trên file_info
+    for info, output in zip(file_info, all_outputs):
+        file_idx, img_type, page_idx = info
         text = output.outputs[0].text.strip()
-        results[file_idx].append(text)
 
-    return results
+        if img_type == 'main':
+            # Đảm bảo danh sách đủ dài
+            while len(main_results[file_idx]) <= page_idx:
+                main_results[file_idx].append("")
+            main_results[file_idx][page_idx] = text
+        elif img_type == 'extra':
+            # Đảm bảo danh sách đủ dài
+            while len(extra_results[file_idx]) <= page_idx:
+                extra_results[file_idx].append("")
+            extra_results[file_idx][page_idx] = text
+
+    return main_results, extra_results
+
 
 # ======= Auto-Batching Processor for Single PDF Requests =======
 # Define request structure
@@ -220,29 +266,32 @@ class OCRBatchProcessor:
         # Extract data
         request_ids, filenames, pdf_datas = zip(*batch_items)
 
-        # Preprocess batch asynchronously
+        # Preprocess batch asynchronously (get both main and extra images) - Gộp trong tuple
         preprocess_tasks = [
             asyncio.create_task(_preprocess_single_file_async(data))
             for data in pdf_datas
         ]
-        all_resized_images_lists = await asyncio.gather(*preprocess_tasks)
+        all_processed_data = await asyncio.gather(*preprocess_tasks) # [(main_imgs, extra_imgs), ...]
 
-        # Batch process OCR
-        batch_results = batch_process_images(all_resized_images_lists)
+        # Batch process OCR for both main and extra images (Gộp vào một batch)
+        main_ocr_results, extra_ocr_results = batch_process_images(
+            all_processed_data # Gửi danh sách tuple [(main_imgs, extra_imgs), ...]
+        )
 
         # Distribute results back to individual requests
-        for i, (req_id, filename, page_texts) in enumerate(zip(request_ids, filenames, batch_results)):
+        for i, (req_id, filename, main_page_texts, extra_page_texts) in enumerate(zip(request_ids, filenames, main_ocr_results, extra_ocr_results)):
             self.results[req_id]['status'] = 'done'
             self.results[req_id]['result'] = {
                 "filename": filename,
-                "num_pages": len(page_texts),
-                "pages": page_texts
+                "num_pages": len(main_page_texts), # Main OCR determines page count
+                "pages": main_page_texts,
+                "extra_ocr_bottom_left": extra_page_texts # Add the extra OCR results
             }
         print(f"Completed batch of {len(batch_items)} files.")
 
 
 # Initialize the batch processor
-ocr_batch_processor = OCRBatchProcessor(max_batch_size=24, batch_timeout=2.0, check_delay=0.1)
+ocr_batch_processor = OCRBatchProcessor(max_batch_size=26, batch_timeout=2.0, check_delay=0.1)
 
 # Start the batch processing loop in the background
 @app.on_event("startup")
@@ -266,36 +315,40 @@ async def ocr_pdf_batch(files: List[UploadFile] = File(...)):
     # Đọc dữ liệu file
     file_datas = [await f.read() for f in files]
 
-    # Tiền xử lý bất đồng bộ cho từng file (PDF -> Images -> Resize)
+    # Tiền xử lý bất đồng bộ cho từng file (PDF -> Images -> Resize -> Crop) - Gộp trong tuple
     preprocess_tasks = [
         asyncio.create_task(_preprocess_single_file_async(data))
         for data in file_datas
     ]
-    all_resized_images_list = await asyncio.gather(*preprocess_tasks)
+    all_processed_data = await asyncio.gather(*preprocess_tasks) # [(main_imgs, extra_imgs), ...]
 
-    # Gom tất cả ảnh lại để xử lý batch OCR
-    batch_results = batch_process_images(all_resized_images_list)
+    # Gom tất cả ảnh lại để xử lý batch OCR (both main and extra) - Gộp trong một batch
+    main_batch_results, extra_batch_results = batch_process_images(
+        all_processed_data # Gửi danh sách tuple [(main_imgs, extra_imgs), ...]
+    )
 
     # Trả về kết quả theo từng file
     final_results = []
-    for idx, page_texts in enumerate(batch_results):
+    for idx, (main_page_texts, extra_page_texts) in enumerate(zip(main_batch_results, extra_batch_results)):
         final_results.append({
             "filename": files[idx].filename,
-            "num_pages": len(page_texts),
-            "pages": page_texts
+            "num_pages": len(main_page_texts), # Main OCR determines page count
+            "pages": main_page_texts,
+            "extra_ocr_bottom_left": extra_page_texts # Add the extra OCR results
         })
 
     return {"files": final_results}
 
-async def _preprocess_single_file_async(pdf_data: bytes):
-    """Tiền xử lý một file: PDF -> Images -> Resize"""
+async def _preprocess_single_file_async(pdf_data: bytes) -> Tuple[List[Image.Image], List[Image.Image]]:
+    """Tiền xử lý một file: PDF -> Images -> Resize -> Crop Bottom-Left. Trả về tuple (main, extra)."""
     images = await pdf_to_images_high_quality_async(pdf_data, dpi=144)
     resized_images = await resize_images_async(images)
-    return resized_images
+    cropped_images = await extract_bottom_left_region_async(resized_images) # Crop the resized images
+    return resized_images, cropped_images # Trả về tuple
 
 
 if __name__ == "__main__":
-    print("Starting DeepSeek-OCR API server with Auto-Batching...")
+    print("Starting DeepSeek-OCR API server with Auto-Batching and Bottom-Left OCR (Improved Batching)...")
     uvicorn.run(
         app,
         host="0.0.0.0",
