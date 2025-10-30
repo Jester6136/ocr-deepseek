@@ -13,12 +13,12 @@ from PIL import Image
 from fastapi import FastAPI, File, UploadFile, HTTPException
 import uvicorn
 from vllm import LLM, SamplingParams
-# from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor # Import cụ thể nếu cần
+from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
 
 app = FastAPI(title="DeepSeek OCR PDF API with Auto-Batching and Bottom-Left OCR (Improved Batching)")
 
 MAX_FILE_CONCURRENT = 32
-BATCH_SIZE_MODEL = MAX_FILE_CONCURRENT * 4
+BATCH_SIZE_MODEL = MAX_FILE_CONCURRENT * 4 + 10
 MAX_LEN = 1400
 # ======= Load model once =======
 llm = LLM(
@@ -27,8 +27,8 @@ llm = LLM(
     mm_processor_cache_gb=0,
     max_num_seqs=BATCH_SIZE_MODEL,
     max_model_len=MAX_LEN,
-    gpu_memory_utilization=0.4,
-    # logits_processors=[NGramPerReqLogitsProcessor] # Bỏ nếu không cần thiết hoặc import sai
+    gpu_memory_utilization=0.32,
+    logits_processors=[NGramPerReqLogitsProcessor]
 )
 
 # ======= OCR params =======
@@ -357,6 +357,41 @@ async def ocr_pdf_batch(files: List[UploadFile] = File(...)):
         })
 
     return {"files": final_results}
+
+@app.post("/ocr/pdf/batch/async")
+async def ocr_pdf_batch_async(files: List[UploadFile] = File(...)):
+    """
+    Endpoint dành riêng cho service ngoài: nhận batch lớn, xử lý tối ưu, trả kết quả ngay.
+    Tận dụng tối đa batching của vLLM.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded")
+    if len(files) > MAX_FILE_CONCURRENT * 2:  # Giới hạn an toàn
+        raise HTTPException(status_code=400, detail=f"Too many files. Max: {MAX_FILE_CONCURRENT * 2}")
+
+    file_datas = [await f.read() for f in files]
+    filenames = [f.filename for f in files]
+
+    # Tiền xử lý batch (giữ nguyên logic hiện tại)
+    all_processed_data = await _preprocess_batch_files_async(file_datas)
+
+    # Xử lý OCR batch lớn (gộp main + extra)
+    main_batch_results, extra_batch_results = batch_process_images(
+        all_processed_data,
+        batch_size=BATCH_SIZE_MODEL  # Dùng full batch size
+    )
+
+    # Trả kết quả
+    final_results = []
+    for idx, (main_page_texts, extra_page_texts) in enumerate(zip(main_batch_results, extra_batch_results)):
+        final_results.append({
+            "file_key": files[idx].filename,
+            "num_pages": len(main_page_texts),
+            "pages": main_page_texts,
+            "extra_ocr_bottom_left": extra_page_texts
+        })
+
+    return {"files": final_results, "batch_size": len(files), "status": "completed"}
 
 if __name__ == "__main__":
     print("Starting DeepSeek-OCR API server with Auto-Batching and Bottom-Left OCR (Improved Batching)...")

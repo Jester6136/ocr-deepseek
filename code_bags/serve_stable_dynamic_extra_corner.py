@@ -15,6 +15,7 @@ from PIL import Image
 from fastapi import FastAPI, File, UploadFile, HTTPException
 import uvicorn
 from vllm import LLM, SamplingParams
+from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
 # from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor # Import cụ thể nếu cần
 
 @asynccontextmanager
@@ -35,7 +36,7 @@ llm = LLM(
     max_num_seqs=BATCH_SIZE_MODEL,
     max_model_len=MAX_LEN,
     gpu_memory_utilization=0.6,
-    # logits_processors=[NGramPerReqLogitsProcessor] # Bỏ nếu không cần thiết hoặc import sai
+    logits_processors=[NGramPerReqLogitsProcessor] # Bỏ nếu không cần thiết hoặc import sai
 )
 
 # ======= OCR params =======
