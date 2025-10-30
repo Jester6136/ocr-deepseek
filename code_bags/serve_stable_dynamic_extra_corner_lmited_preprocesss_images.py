@@ -3,8 +3,6 @@ import os
 import tempfile
 import time
 import uuid
-from contextlib import asynccontextmanager
-import anyio
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Tuple, TypeVar, Generic
 import asyncio
@@ -17,15 +15,10 @@ import uvicorn
 from vllm import LLM, SamplingParams
 # from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor # Import cụ thể nếu cần
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    limiter = anyio.to_thread.current_default_thread_limiter()
-    limiter.total_tokens = 100
-    yield
+app = FastAPI(title="DeepSeek OCR PDF API with Auto-Batching and Bottom-Left OCR (Improved Batching)")
 
-app = FastAPI(lifespan=lifespan, title="DeepSeek OCR PDF API with Auto-Batching and Bottom-Left OCR (Improved Batching)")
-
-BATCH_SIZE_MODEL = 60 * 4 + 4
+MAX_FILE_CONCURRENT = 32
+BATCH_SIZE_MODEL = MAX_FILE_CONCURRENT * 4
 MAX_LEN = 1400
 # ======= Load model once =======
 llm = LLM(
@@ -34,7 +27,7 @@ llm = LLM(
     mm_processor_cache_gb=0,
     max_num_seqs=BATCH_SIZE_MODEL,
     max_model_len=MAX_LEN,
-    gpu_memory_utilization=0.6,
+    gpu_memory_utilization=0.4,
     # logits_processors=[NGramPerReqLogitsProcessor] # Bỏ nếu không cần thiết hoặc import sai
 )
 
@@ -195,13 +188,40 @@ def batch_process_images(
     return main_results, extra_results
 
 
+# ======= Async batch preprocessing =======
+async def _preprocess_batch_files_async(pdf_datas: List[bytes]) -> List[Tuple[List[Image.Image], List[Image.Image]]]:
+    """Tiền xử lý batch các file: PDF -> Images -> Resize -> Crop Bottom-Left"""
+    # Chia nhỏ batch để không quá tải CPU
+    batch_size = 16  # Giảm để phù hợp với 36 luồng CPU
+    all_results = []
+    
+    for i in range(0, len(pdf_datas), batch_size):
+        batch_pdf_datas = pdf_datas[i:i + batch_size]
+        
+        # Xử lý async cho từng file trong batch nhỏ
+        preprocess_tasks = [
+            asyncio.create_task(_preprocess_single_file_internal_async(data))
+            for data in batch_pdf_datas
+        ]
+        batch_results = await asyncio.gather(*preprocess_tasks)
+        all_results.extend(batch_results)
+        
+        # Thêm delay nhỏ giữa các batch nhỏ để giảm áp lực CPU
+        if i + batch_size < len(pdf_datas):
+            await asyncio.sleep(0.1)
+    
+    return all_results
+
+async def _preprocess_single_file_internal_async(pdf_data: bytes) -> Tuple[List[Image.Image], List[Image.Image]]:
+    """Tiền xử lý một file: PDF -> Images -> Resize -> Crop Bottom-Left. Trả về tuple (main, extra)."""
+    images = await pdf_to_images_high_quality_async(pdf_data, dpi=144)
+    resized_images = await resize_images_async(images)
+    cropped_images = await extract_bottom_left_region_async(resized_images)
+    return resized_images, cropped_images
+
 # ======= Auto-Batching Processor for Single PDF Requests =======
 # Define request structure
 from pydantic import BaseModel
-
-class SinglePDFRequest(BaseModel):
-    filename: str
-    pdf_data: bytes
 
 class OCRBatchProcessor:
     def __init__(self, max_batch_size: int = 10, batch_timeout: float = 0.5, check_delay: float = 0.1):
@@ -218,7 +238,6 @@ class OCRBatchProcessor:
         request_id = str(uuid.uuid4())
         self.results[request_id] = {'status': 'pending', 'result': None}
         await self.queue.put((request_id, filename, pdf_data))
-        print(f"Added request {request_id} for file {filename} to queue. Queue size: {self.queue.qsize()}")
         return request_id
 
     async def get_result(self, request_id: str) -> Dict:
@@ -275,12 +294,8 @@ class OCRBatchProcessor:
         # Extract data
         request_ids, filenames, pdf_datas = zip(*batch_items)
 
-        # Preprocess batch asynchronously (get both main and extra images) - Gộp trong tuple
-        preprocess_tasks = [
-            asyncio.create_task(_preprocess_single_file_async(data))
-            for data in pdf_datas
-        ]
-        all_processed_data = await asyncio.gather(*preprocess_tasks) # [(main_imgs, extra_imgs), ...]
+        # Preprocess batch asynchronously (get both main and extra images) - Batch riêng
+        all_processed_data = await _preprocess_batch_files_async(pdf_datas)
 
         # Batch process OCR for both main and extra images (Gộp vào một batch)
         main_ocr_results, extra_ocr_results = batch_process_images(
@@ -298,9 +313,8 @@ class OCRBatchProcessor:
             }
         print(f"Completed batch of {len(batch_items)} files.")
 
-
 # Initialize the batch processor
-ocr_batch_processor = OCRBatchProcessor(max_batch_size=60, batch_timeout=2.0, check_delay=0.1)
+ocr_batch_processor = OCRBatchProcessor(max_batch_size=MAX_FILE_CONCURRENT, batch_timeout=2.0, check_delay=0.1)  # Giảm batch size
 
 # Start the batch processing loop in the background
 @app.on_event("startup")
@@ -324,12 +338,8 @@ async def ocr_pdf_batch(files: List[UploadFile] = File(...)):
     # Đọc dữ liệu file
     file_datas = [await f.read() for f in files]
 
-    # Tiền xử lý bất đồng bộ cho từng file (PDF -> Images -> Resize -> Crop) - Gộp trong tuple
-    preprocess_tasks = [
-        asyncio.create_task(_preprocess_single_file_async(data))
-        for data in file_datas
-    ]
-    all_processed_data = await asyncio.gather(*preprocess_tasks) # [(main_imgs, extra_imgs), ...]
+    # Tiền xử lý batch cho các file (PDF -> Images -> Resize -> Crop) - Batch riêng
+    all_processed_data = await _preprocess_batch_files_async(file_datas)
 
     # Gom tất cả ảnh lại để xử lý batch OCR (both main and extra) - Gộp trong một batch
     main_batch_results, extra_batch_results = batch_process_images(
@@ -347,14 +357,6 @@ async def ocr_pdf_batch(files: List[UploadFile] = File(...)):
         })
 
     return {"files": final_results}
-
-async def _preprocess_single_file_async(pdf_data: bytes) -> Tuple[List[Image.Image], List[Image.Image]]:
-    """Tiền xử lý một file: PDF -> Images -> Resize -> Crop Bottom-Left. Trả về tuple (main, extra)."""
-    images = await pdf_to_images_high_quality_async(pdf_data, dpi=144)
-    resized_images = await resize_images_async(images)
-    cropped_images = await extract_bottom_left_region_async(resized_images) # Crop the resized images
-    return resized_images, cropped_images # Trả về tuple
-
 
 if __name__ == "__main__":
     print("Starting DeepSeek-OCR API server with Auto-Batching and Bottom-Left OCR (Improved Batching)...")
