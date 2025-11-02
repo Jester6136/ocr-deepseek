@@ -17,26 +17,27 @@ from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
 
 app = FastAPI(title="DeepSeek OCR PDF API with Auto-Batching")
 
-BATCH_SIZE_MODEL = 60
+BATCH_SIZE_MODEL = 500
+MAX_TOKEN = 1000
 # ======= Load model once =======
 llm = LLM(
-    model="/home/vms/bags/ocr-deepseek/models/deepseek-ai/DeepSeek-OCR",
+    model="models/DeepSeek-OCR",
     enable_prefix_caching=False,
     mm_processor_cache_gb=0,
     max_num_seqs=BATCH_SIZE_MODEL,
-    max_model_len=1400,
-    gpu_memory_utilization=0.8,
+    max_model_len=MAX_TOKEN,
+    gpu_memory_utilization=0.32,
     logits_processors=[NGramPerReqLogitsProcessor]
 )
 
 # ======= OCR params =======
 sampling_param = SamplingParams(
     temperature=0.0,
-    max_tokens=1400,
+    max_tokens=MAX_TOKEN,
     extra_args=dict(
-        ngram_size=30,
-        window_size=90,
-        whitelist_token_ids={128821, 128822},
+        ngram_size=2,
+        window_size=5,
+        # whitelist_token_ids={128821, 128822},
     ),
     skip_special_tokens=False,
 )
@@ -54,26 +55,24 @@ async def pdf_to_images_high_quality_async(pdf_data: bytes, dpi: int = 144) -> L
         )
     return images
 
-def _sync_pdf_to_images_helper(pdf_data: bytes, dpi: int):
-    """Helper function to run synchronous PDF processing in a thread pool"""
-    images = []
-    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_pdf:
-        temp_pdf.write(pdf_data)
-        temp_pdf_path = temp_pdf.name
-
+def _sync_pdf_to_images_helper(pdf_data: bytes, dpi: int = 144):
     try:
-        pdf_document = fitz.open(temp_pdf_path)
-        zoom = dpi / 72.0
-        matrix = fitz.Matrix(zoom, zoom)
-        for page_num in range(pdf_document.page_count):
-            page = pdf_document[page_num]
-            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
-            img_data = pixmap.tobytes("png")
-            img = Image.open(io.BytesIO(img_data)).convert("RGB")
-            images.append(img)
-        pdf_document.close()
-    finally:
-        os.unlink(temp_pdf_path)
+        # Open directly from memory
+        doc = fitz.open(stream=pdf_data, filetype="pdf")
+    except Exception as e:
+        raise RuntimeError(f"PyMuPDF failed to open PDF stream: {e}") from e
+
+    images = []
+    zoom = dpi / 72.0
+    matrix = fitz.Matrix(zoom, zoom)
+
+    for page in doc:
+        pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+        img_data = pixmap.tobytes("png")
+        img = Image.open(io.BytesIO(img_data)).convert("RGB")
+        images.append(img)
+
+    doc.close()
     return images
 
 # ======= Async Resize =======
@@ -163,7 +162,6 @@ class OCRBatchProcessor:
         request_id = str(uuid.uuid4())
         self.results[request_id] = {'status': 'pending', 'result': None}
         await self.queue.put((request_id, filename, pdf_data))
-        print(f"Added request {request_id} for file {filename} to queue. Queue size: {self.queue.qsize()}")
         return request_id
 
     async def get_result(self, request_id: str) -> Dict:
@@ -242,7 +240,7 @@ class OCRBatchProcessor:
 
 
 # Initialize the batch processor
-ocr_batch_processor = OCRBatchProcessor(max_batch_size=24, batch_timeout=2.0, check_delay=0.1)
+ocr_batch_processor = OCRBatchProcessor(max_batch_size=40, batch_timeout=2.0, check_delay=0.1)
 
 # Start the batch processing loop in the background
 @app.on_event("startup")
@@ -264,7 +262,7 @@ async def ocr_pdf_batch(files: List[UploadFile] = File(...)):
         raise HTTPException(status_code=400, detail="No files uploaded")
 
     # Đọc dữ liệu file
-    file_datas = [await f.read() for f in files]
+    file_datas = await asyncio.gather(*[f.read() for f in files])
 
     # Tiền xử lý bất đồng bộ cho từng file (PDF -> Images -> Resize)
     preprocess_tasks = [
@@ -299,7 +297,7 @@ if __name__ == "__main__":
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=5556,
+        port=37001,
         reload=False,
-        workers=1 # Quan trọng cho vLLM
+        workers=1
     )

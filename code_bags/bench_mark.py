@@ -5,10 +5,10 @@ import json
 from pathlib import Path
 
 # Cấu hình
-API_URL = "http://localhost:5556/ocr/pdf"  # Endpoint mới, xử lý đơn file nhưng có auto-batch
+API_URL = "http://localhost:37001/ocr/pdf"  # Endpoint mới, xử lý đơn file nhưng có auto-batch
 PDF_FILE_PATH = "samples/11950-GCN-BK 763735.pdf"
-NUM_REQUESTS = 32 * 2  # Số lượng request gửi đi
-CONCURRENT_REQUESTS = 32  # Số lượng request gửi đồng thời (điều chỉnh để test tải)
+NUM_REQUESTS = 150 * 2  # Số lượng request gửi đi
+CONCURRENT_REQUESTS = 150  # Số lượng request gửi đồng thời (điều chỉnh để test tải)
 OUTPUT_FILE = "benchmark_results.jsonl" # Tên file output
 
 async def send_single_request(session, file_path, request_idx):
