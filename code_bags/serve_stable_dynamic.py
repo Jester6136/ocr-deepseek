@@ -19,6 +19,7 @@ app = FastAPI(title="DeepSeek OCR PDF API with Auto-Batching")
 
 BATCH_SIZE_MODEL = 500
 MAX_TOKEN = 1000
+MAX_FILE_BATCH_SIZE=100
 # ======= Load model once =======
 llm = LLM(
     model="models/DeepSeek-OCR",
@@ -26,7 +27,7 @@ llm = LLM(
     mm_processor_cache_gb=0,
     max_num_seqs=BATCH_SIZE_MODEL,
     max_model_len=MAX_TOKEN,
-    gpu_memory_utilization=0.32,
+    gpu_memory_utilization=0.38,
     logits_processors=[NGramPerReqLogitsProcessor]
 )
 
@@ -240,7 +241,7 @@ class OCRBatchProcessor:
 
 
 # Initialize the batch processor
-ocr_batch_processor = OCRBatchProcessor(max_batch_size=40, batch_timeout=2.0, check_delay=0.1)
+ocr_batch_processor = OCRBatchProcessor(max_batch_size=MAX_FILE_BATCH_SIZE, batch_timeout=2.0, check_delay=0.1)
 
 # Start the batch processing loop in the background
 @app.on_event("startup")
