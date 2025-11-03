@@ -19,7 +19,7 @@ app = FastAPI(title="DeepSeek OCR PDF API with Auto-Batching")
 
 BATCH_SIZE_MODEL = 500
 MAX_TOKEN = 1000
-MAX_FILE_BATCH_SIZE=100
+MAX_FILE_BATCH_SIZE=80
 # ======= Load model once =======
 llm = LLM(
     model="models/DeepSeek-OCR",
