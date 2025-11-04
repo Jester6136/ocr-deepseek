@@ -1,29 +1,21 @@
-import datetime
 import io
-import json
 import os
-import tempfile
 import time
 import uuid
-from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Tuple, TypeVar, Generic
+from typing import List, Dict, Tuple
 import asyncio
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-import zipfile
-
-from requests import Request
-
+from concurrent.futures import ProcessPoolExecutor
 import fitz  # PyMuPDF
 from PIL import Image
-from fastapi import FastAPI, File, Path, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException
 import uvicorn
 from vllm import LLM, SamplingParams
 from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
 
 app = FastAPI(title="DeepSeek OCR PDF API with Auto-Batching and Bottom-Left OCR (Improved Batching)")
 
-FILE_PREPROCESS_LIMIT = 128
-MAX_FILE_CONCURRENT = 128
+FILE_PREPROCESS_LIMIT = 64
+MAX_FILE_CONCURRENT = 64
 BATCH_SIZE_MODEL = MAX_FILE_CONCURRENT * 4 + 20
 MAX_LEN = 1300
 
@@ -38,7 +30,7 @@ llm = LLM(
     mm_processor_cache_gb=0,
     max_num_seqs=BATCH_SIZE_MODEL,
     max_model_len=MAX_LEN,
-    gpu_memory_utilization=0.29 * 2,
+    gpu_memory_utilization=0.29,
     logits_processors=[NGramPerReqLogitsProcessor]
 )
 

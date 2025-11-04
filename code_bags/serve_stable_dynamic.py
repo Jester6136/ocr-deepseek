@@ -6,7 +6,7 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Tuple, TypeVar, Generic
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 
 import fitz  # PyMuPDF
 from PIL import Image
@@ -18,9 +18,13 @@ from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
 app = FastAPI(title="DeepSeek OCR PDF API with Auto-Batching")
 
 BATCH_SIZE_MODEL = 500
-MAX_TOKEN = 1000
-MAX_FILE_BATCH_SIZE=80
+MAX_TOKEN = 960
+MAX_FILE_BATCH_SIZE=60
 # ======= Load model once =======
+# Tối ưu: Dùng ProcessPoolExecutor toàn cục, tái sử dụng
+MAX_WORKERS = min(32, (os.cpu_count() or 4) * 2)  # Tối đa 32, hoặc 2x số core
+process_executor = ProcessPoolExecutor(max_workers=MAX_WORKERS)
+
 llm = LLM(
     model="models/DeepSeek-OCR",
     enable_prefix_caching=False,
@@ -43,26 +47,22 @@ sampling_param = SamplingParams(
     skip_special_tokens=False,
 )
 
+
 # ======= Async PDF → images =======
 async def pdf_to_images_high_quality_async(pdf_data: bytes, dpi: int = 144) -> List[Image.Image]:
-    """Convert PDF bytes to high-quality PIL Images asynchronously using ThreadPoolExecutor"""
     loop = asyncio.get_event_loop()
-    with ThreadPoolExecutor() as executor:
-        images = await loop.run_in_executor(
-            executor,
-            _sync_pdf_to_images_helper,
-            pdf_data,
-            dpi
-        )
-    return images
+    return await loop.run_in_executor(
+        process_executor,
+        _sync_pdf_to_images_helper,
+        pdf_data,
+        dpi
+    )
 
-def _sync_pdf_to_images_helper(pdf_data: bytes, dpi: int = 144):
-    try:
-        # Open directly from memory
-        doc = fitz.open(stream=pdf_data, filetype="pdf")
-    except Exception as e:
-        raise RuntimeError(f"PyMuPDF failed to open PDF stream: {e}") from e
+def _sync_pdf_to_images_helper(pdf_data: bytes, dpi: int = 144) -> List[Image.Image]:
+    if len(pdf_data) < 4 or pdf_data[:4] != b'%PDF':
+        raise ValueError("Invalid PDF: missing %PDF header")
 
+    doc = fitz.open(stream=pdf_data, filetype="pdf")
     images = []
     zoom = dpi / 72.0
     matrix = fitz.Matrix(zoom, zoom)
@@ -76,21 +76,18 @@ def _sync_pdf_to_images_helper(pdf_data: bytes, dpi: int = 144):
     doc.close()
     return images
 
+
 # ======= Async Resize =======
 async def resize_images_async(images: List[Image.Image], size=(1024, 1024)) -> List[Image.Image]:
-    """Resize a list of images asynchronously using ThreadPoolExecutor"""
     loop = asyncio.get_event_loop()
-    with ThreadPoolExecutor() as executor:
-        resized_images = await loop.run_in_executor(
-            executor,
-            _sync_resize_helper,
-            images,
-            size
-        )
-    return resized_images
+    return await loop.run_in_executor(
+        process_executor,
+        _sync_resize_helper,
+        images,
+        size
+    )
 
-def _sync_resize_helper(images: List[Image.Image], size):
-    """Helper function to run synchronous image resizing in a thread pool"""
+def _sync_resize_helper(images: List[Image.Image], size=(1024, 1024)) -> List[Image.Image]:
     return [img.resize(size, Image.LANCZOS) for img in images]
 
 # ======= Batch processing helper =======
