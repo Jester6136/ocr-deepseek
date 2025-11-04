@@ -8,7 +8,10 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Tuple, TypeVar, Generic
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import zipfile
+
+from requests import Request
 
 import fitz  # PyMuPDF
 from PIL import Image
@@ -19,10 +22,15 @@ from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
 
 app = FastAPI(title="DeepSeek OCR PDF API with Auto-Batching and Bottom-Left OCR (Improved Batching)")
 
-FILE_PREPROCESS_LIMIT = 32
-MAX_FILE_CONCURRENT = 32
+FILE_PREPROCESS_LIMIT = 128
+MAX_FILE_CONCURRENT = 128
 BATCH_SIZE_MODEL = MAX_FILE_CONCURRENT * 4 + 20
 MAX_LEN = 1300
+
+# Tối ưu: Dùng ProcessPoolExecutor toàn cục, tái sử dụng
+MAX_WORKERS = min(32, (os.cpu_count() or 4) * 2)  # Tối đa 32, hoặc 2x số core
+process_executor = ProcessPoolExecutor(max_workers=MAX_WORKERS)
+
 # ======= Load model once =======
 llm = LLM(
     model="models/DeepSeek-OCR",
@@ -30,7 +38,7 @@ llm = LLM(
     mm_processor_cache_gb=0,
     max_num_seqs=BATCH_SIZE_MODEL,
     max_model_len=MAX_LEN,
-    gpu_memory_utilization=0.29,
+    gpu_memory_utilization=0.29 * 2,
     logits_processors=[NGramPerReqLogitsProcessor]
 )
 
@@ -48,28 +56,19 @@ sampling_param = SamplingParams(
 
 # ======= Async PDF → images =======
 async def pdf_to_images_high_quality_async(pdf_data: bytes, dpi: int = 144) -> List[Image.Image]:
-    """Convert PDF bytes to high-quality PIL Images asynchronously using ThreadPoolExecutor"""
     loop = asyncio.get_event_loop()
-    with ThreadPoolExecutor() as executor:
-        images = await loop.run_in_executor(
-            executor,
-            _sync_pdf_to_images_helper,
-            pdf_data,
-            dpi
-        )
-    return images
+    return await loop.run_in_executor(
+        process_executor,
+        _sync_pdf_to_images_helper,
+        pdf_data,
+        dpi
+    )
 
-def _sync_pdf_to_images_helper(pdf_data: bytes, dpi: int = 144):
-    """Convert PDF bytes to list of PIL Images without temp files"""
+def _sync_pdf_to_images_helper(pdf_data: bytes, dpi: int = 144) -> List[Image.Image]:
     if len(pdf_data) < 4 or pdf_data[:4] != b'%PDF':
         raise ValueError("Invalid PDF: missing %PDF header")
 
-    try:
-        # Open directly from memory
-        doc = fitz.open(stream=pdf_data, filetype="pdf")
-    except Exception as e:
-        raise RuntimeError(f"PyMuPDF failed to open PDF stream: {e}") from e
-
+    doc = fitz.open(stream=pdf_data, filetype="pdf")
     images = []
     zoom = dpi / 72.0
     matrix = fitz.Matrix(zoom, zoom)
@@ -85,32 +84,25 @@ def _sync_pdf_to_images_helper(pdf_data: bytes, dpi: int = 144):
 
 # ======= Async Resize =======
 async def resize_images_async(images: List[Image.Image], size=(1024, 1024)) -> List[Image.Image]:
-    """Resize a list of images asynchronously using ThreadPoolExecutor"""
     loop = asyncio.get_event_loop()
-    with ThreadPoolExecutor() as executor:
-        resized_images = await loop.run_in_executor(
-            executor,
-            _sync_resize_helper,
-            images,
-            size
-        )
-    return resized_images
+    return await loop.run_in_executor(
+        process_executor,
+        _sync_resize_helper,
+        images,
+        size
+    )
 
-def _sync_resize_helper(images: List[Image.Image], size):
-    """Helper function to run synchronous image resizing in a thread pool"""
+def _sync_resize_helper(images: List[Image.Image], size=(1024, 1024)) -> List[Image.Image]:
     return [img.resize(size, Image.LANCZOS) for img in images]
 
 # ======= Async Extract Bottom-Left Region =======
 async def extract_bottom_left_region_async(images: List[Image.Image]) -> List[Image.Image]:
-    """Extract the bottom-left region (3/10 width, 1/3 height) from a list of images asynchronously using ThreadPoolExecutor"""
     loop = asyncio.get_event_loop()
-    with ThreadPoolExecutor() as executor:
-        cropped_images = await loop.run_in_executor(
-            executor,
-            _sync_extract_bottom_left_helper,
-            images
-        )
-    return cropped_images
+    return await loop.run_in_executor(
+        process_executor,
+        _sync_extract_bottom_left_helper,
+        images
+    )
 
 def _sync_extract_bottom_left_helper(images: List[Image.Image]):
     """Helper function to run synchronous image cropping in a thread pool"""
@@ -191,39 +183,31 @@ def batch_process_images(
 
 # ======= Async batch preprocessing =======
 async def _preprocess_batch_files_async(pdf_datas: List[bytes]) -> List[Tuple[List[Image.Image], List[Image.Image]]]:
-    """Tiền xử lý batch các file: PDF -> Images -> Resize -> Crop Bottom-Left"""
-    # Chia nhỏ batch để không quá tải CPU
+    """Tiền xử lý batch các file: PDF -> Images -> Resize -> Crop"""
     batch_size = FILE_PREPROCESS_LIMIT
     all_results = []
-    
+
     for i in range(0, len(pdf_datas), batch_size):
         batch_pdf_datas = pdf_datas[i:i + batch_size]
-        
-        # Xử lý async cho từng file trong batch nhỏ
-        preprocess_tasks = [
+        tasks = [
             asyncio.create_task(_preprocess_single_file_internal_async(data))
             for data in batch_pdf_datas
         ]
-        batch_results = await asyncio.gather(*preprocess_tasks)
+        batch_results = await asyncio.gather(*tasks)
         all_results.extend(batch_results)
-        
-        # Thêm delay nhỏ giữa các batch nhỏ để giảm áp lực CPU
+
         if i + batch_size < len(pdf_datas):
-            await asyncio.sleep(0.1)
-    
+            await asyncio.sleep(0.05)  # Giảm từ 0.1 → 0.05
+
     return all_results
 
 async def _preprocess_single_file_internal_async(pdf_data: bytes) -> Tuple[List[Image.Image], List[Image.Image]]:
-    """Tiền xử lý một file: PDF -> Images -> Resize -> Crop Bottom-Left (chỉ 2 trang đầu)."""
+    """Tiền xử lý một file: PDF → Images → Resize → Crop Bottom-Left (chỉ 2 trang đầu)."""
+    
     images = await pdf_to_images_high_quality_async(pdf_data, dpi=144)
     resized_images = await resize_images_async(images)
-
-    # Chỉ crop 2 trang đầu tiên
     first_two = resized_images[:2]
-    cropped_images = []
-    if first_two:
-        cropped_images = await extract_bottom_left_region_async(first_two)
-
+    cropped_images = await extract_bottom_left_region_async(first_two) if first_two else []
     return resized_images, cropped_images
 
 # ======= Auto-Batching Processor for Single PDF Requests =======
@@ -416,6 +400,65 @@ async def ocr_image_single(file: UploadFile = File(...)):
     asyncio.create_task(append_ocr_result(result, file.filename, str(uuid.uuid4())))
 
     return result
+
+# @app.post("/ocr/pdf/zip", response_model=dict)
+# async def ocr_pdf_zip(request: Request) -> Any:
+#     start_time = time.time()
+
+#     # Đọc toàn bộ zip từ body (1 stream duy nhất)
+#     zip_bytes = await request.body()
+#     zip_buf = io.BytesIO(zip_bytes)
+
+#     # Giải nén zip trong bộ nhớ
+#     try:
+#         with zipfile.ZipFile(zip_buf, "r") as zf:
+#             pdf_names = [n for n in zf.namelist() if n.lower().endswith(".pdf")]
+#             if not pdf_names:
+#                 raise HTTPException(status_code=400, detail="ZIP không chứa file PDF nào.")
+            
+#             # Đọc song song nội dung PDF để tận dụng I/O
+#             loop = asyncio.get_event_loop()
+#             async def read_pdf(name):
+#                 return name, await loop.run_in_executor(None, zf.read, name)
+            
+#             pdf_results = await asyncio.gather(*[read_pdf(name) for name in pdf_names])
+#     except zipfile.BadZipFile:
+#         raise HTTPException(status_code=400, detail="Tệp ZIP không hợp lệ.")
+
+#     # Sắp xếp lại kết quả
+#     filenames, file_datas = zip(*pdf_results)
+
+#     # === Tiền xử lý batch (PDF → Image) ===
+#     all_processed_data = await _preprocess_batch_files_async(list(file_datas))
+
+#     # === Xử lý OCR batch (DeepSeek vLLM) ===
+#     main_batch_results, extra_batch_results = batch_process_images(
+#         all_processed_data,
+#         batch_size=BATCH_SIZE_MODEL
+#     )
+
+#     # === Chuẩn hóa kết quả ===
+#     final_results = []
+#     for idx, (main_texts, extra_texts) in enumerate(zip(main_batch_results, extra_batch_results)):
+#         num_pages = len(main_texts)
+#         padded_extra = ["" for _ in range(num_pages)]
+#         for j in range(min(2, len(extra_texts))):
+#             padded_extra[j] = extra_texts[j]
+#         final_results.append({
+#             "filename": filenames[idx],
+#             "num_pages": num_pages,
+#             "pages": main_texts,
+#             "extra_ocr_bottom_left": padded_extra
+#         })
+
+#     duration = round(time.time() - start_time, 2)
+#     return {
+#         "files": final_results,
+#         "batch_size": len(final_results),
+#         "status": "completed",
+#         "processing_time_sec": duration
+#     }
+
 if __name__ == "__main__":
     print("Starting DeepSeek-OCR API server with Auto-Batching and Bottom-Left OCR (Improved Batching)...")
     uvicorn.run(
